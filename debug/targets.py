@@ -44,6 +44,20 @@ class Hart:
     # jumpers.
     reset_vectors = []
 
+    # system is set to an identifier of the system this hart belongs to.  Harts
+    # within the same system are assumed to share memory, and to have unique
+    # hartids within that system.  So for most cases the default value of None
+    # is fine.
+    system = None
+
+    def __init__(self, misa=None, system=None, link_script_path=None):
+        if misa:
+            self.misa = misa
+        if system:
+            self.system = system
+        if link_script_path:
+            self.link_script_path = link_script_path
+
     def extensionSupported(self, letter):
         # target.misa is set by testlib.ExamineTarget
         if self.misa:
@@ -108,6 +122,10 @@ class Target:
     # limitation/hardware support.
     support_memory_sampling = True
 
+    # Relative path to a FreeRTOS binary compiled from the spike demo project
+    # in https://github.com/FreeRTOS/FreeRTOS.
+    freertos_binary = None
+
     # Internal variables:
     directory = None
     temporary_files = []
@@ -143,17 +161,18 @@ class Target:
     def create(self):
         """Create the target out of thin air, eg. start a simulator."""
 
-    def server(self):
+    def server(self, test):
         """Start the debug server that gdb connects to, eg. OpenOCD."""
         return testlib.Openocd(server_cmd=self.server_cmd,
                 config=self.openocd_config_path,
-                timeout=self.server_timeout_sec)
+                timeout=self.server_timeout_sec,
+                freertos=test.freertos())
 
     def do_compile(self, hart, *sources):
-        binary_name = "%s_%s-%d" % (
+        binary_name = "%s_%s-%x" % (
                 self.name,
                 os.path.basename(os.path.splitext(sources[0])[0]),
-                hart.xlen)
+                hart.misa)
         if Target.isolate:
             self.temporary_binary = tempfile.NamedTemporaryFile(
                     prefix=binary_name + "_")
@@ -191,7 +210,7 @@ class Target:
         return binary_name
 
     def compile(self, hart, *sources):
-        while True:
+        for _ in range(2):
             try:
                 return self.do_compile(hart, *sources)
             except testlib.CompileError as e:

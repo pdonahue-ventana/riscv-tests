@@ -65,7 +65,7 @@ class Spike:
     def __init__(self, target, halted=False, timeout=None, with_jtag_gdb=True,
             isa=None, progbufsize=None, dmi_rti=None, abstract_rti=None,
             support_hasel=True, support_abstract_csr=True,
-            support_haltgroups=True, vlen=128, elen=64, slen=128):
+            support_haltgroups=True, vlen=128, elen=64, slen=128, harts=None):
         """Launch spike. Return tuple of its process and the port it's running
         on."""
         self.process = None
@@ -80,21 +80,19 @@ class Spike:
         self.elen = elen
         self.slen = slen
 
-        if target.harts:
-            harts = target.harts
-        else:
-            harts = [target]
+        self.harts = harts or target.harts or [target]
 
-        cmd = self.command(target, harts, halted, timeout, with_jtag_gdb)
-        self.infinite_loop = target.compile(harts[0],
+        cmd = self.command(target, halted, timeout, with_jtag_gdb)
+        self.infinite_loop = target.compile(self.harts[0],
                 "programs/checksum.c", "programs/tiny-malloc.c",
                 "programs/infinite_loop.S", "-DDEFINE_MALLOC", "-DDEFINE_FREE")
         cmd.append(self.infinite_loop)
         self.logfile = tempfile.NamedTemporaryFile(prefix="spike-",
                 suffix=".log")
-        self.logname = self.logfile.name
+        logname = self.logfile.name
+        self.lognames = [logname]
         if print_log_names:
-            real_stdout.write("Temporary spike log: %s\n" % self.logname)
+            real_stdout.write("Temporary spike log: %s\n" % logname)
         self.logfile.write(("+ %s\n" % " ".join(cmd)).encode())
         self.logfile.flush()
         self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -104,34 +102,34 @@ class Spike:
             self.port = None
             for _ in range(30):
                 m = re.search(r"Listening for remote bitbang connection on "
-                        r"port (\d+).", open(self.logname).read())
+                        r"port (\d+).", open(logname).read())
                 if m:
                     self.port = int(m.group(1))
                     os.environ['REMOTE_BITBANG_PORT'] = m.group(1)
                     break
                 time.sleep(0.11)
             if not self.port:
-                print_log(self.logname)
+                print_log(logname)
                 raise Exception("Didn't get spike message about bitbang "
                         "connection")
 
     # pylint: disable=too-many-branches
-    def command(self, target, harts, halted, timeout, with_jtag_gdb):
+    def command(self, target, halted, timeout, with_jtag_gdb):
         # pylint: disable=no-self-use
         if target.sim_cmd:
             cmd = shlex.split(target.sim_cmd)
         else:
             cmd = ["spike"]
 
-        cmd += ["-p%d" % len(harts)]
+        cmd += ["-p%d" % len(self.harts)]
 
-        assert len(set(t.xlen for t in harts)) == 1, \
+        assert len(set(t.xlen for t in self.harts)) == 1, \
                 "All spike harts must have the same XLEN"
 
         if self.isa:
             isa = self.isa
         else:
-            isa = "RV%dG" % harts[0].xlen
+            isa = "RV%dG" % self.harts[0].xlen
 
         cmd += ["--isa", isa]
         cmd += ["--dm-auth"]
@@ -159,12 +157,12 @@ class Spike:
             cmd.append("--varch=vlen:%d,elen:%d,slen:%d" % (self.vlen,
                 self.elen, self.slen))
 
-        assert len(set(t.ram for t in harts)) == 1, \
+        assert len(set(t.ram for t in self.harts)) == 1, \
                 "All spike harts must have the same RAM layout"
-        assert len(set(t.ram_size for t in harts)) == 1, \
+        assert len(set(t.ram_size for t in self.harts)) == 1, \
                 "All spike harts must have the same RAM layout"
-        os.environ['WORK_AREA'] = '0x%x' % harts[0].ram
-        cmd += ["-m0x%x:0x%x" % (harts[0].ram, harts[0].ram_size)]
+        os.environ['WORK_AREA'] = '0x%x' % self.harts[0].ram
+        cmd += ["-m0x%x:0x%x" % (self.harts[0].ram, self.harts[0].ram_size)]
 
         if timeout:
             cmd = ["timeout", str(timeout)] + cmd
@@ -187,6 +185,48 @@ class Spike:
 
     def wait(self, *args, **kwargs):
         return self.process.wait(*args, **kwargs)
+
+class MultiSpike:
+    def __init__(self, spikes):
+        self.process = None
+
+        self.spikes = spikes
+        self.lognames = sum((spike.lognames for spike in spikes), [])
+        self.logfile = tempfile.NamedTemporaryFile(prefix="daisychain-",
+                suffix=".log")
+        self.lognames.append(self.logfile.name)
+
+        # Now create the daisy-chain process.
+        cmd = ["./rbb_daisychain.py", "0"] + \
+            [str(spike.port) for spike in spikes]
+        self.logfile.write(("+ %s\n" % cmd).encode())
+        self.logfile.flush()
+        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                stdout=self.logfile, stderr=self.logfile)
+
+        self.port = None
+        for _ in range(30):
+            m = re.search(r"Listening on port (\d+).",
+                          open(self.lognames[-1]).read())
+            if m:
+                self.port = int(m.group(1))
+                break
+            time.sleep(0.11)
+        if not self.port:
+            print_log(self.lognames[-1])
+            raise Exception("Didn't get daisy chain message about which port "
+                            "it's listening on.")
+
+        os.environ['REMOTE_BITBANG_HOST'] = 'localhost'
+        os.environ['REMOTE_BITBANG_PORT'] = str(self.port)
+
+    def __del__(self):
+        if self.process:
+            try:
+                self.process.kill()
+                self.process.wait()
+            except OSError:
+                pass
 
 class VcsSim:
     logfile = tempfile.NamedTemporaryFile(prefix='simv', suffix='.log')
@@ -245,7 +285,8 @@ class Openocd:
     logfile = tempfile.NamedTemporaryFile(prefix='openocd', suffix='.log')
     logname = logfile.name
 
-    def __init__(self, server_cmd=None, config=None, debug=False, timeout=60):
+    def __init__(self, server_cmd=None, config=None, debug=False, timeout=60,
+                 freertos=False):
         self.timeout = timeout
 
         if server_cmd:
@@ -280,6 +321,12 @@ class Openocd:
         if debug:
             cmd.append("-d")
 
+        extra_env = {}
+        if freertos:
+            extra_env['USE_FREERTOS'] = "1"
+        else:
+            extra_env['USE_FREERTOS'] = "0"
+
         raw_logfile = open(Openocd.logname, "wb")
         try:
             spike_dasm = subprocess.Popen("spike-dasm", stdin=subprocess.PIPE,
@@ -292,17 +339,21 @@ class Openocd:
         env_entries = ("REMOTE_BITBANG_HOST", "REMOTE_BITBANG_PORT",
                 "WORK_AREA")
         env_entries = [key for key in env_entries if key in os.environ]
-        logfile.write(("+ %s%s\n" % (
-            "".join("%s=%s " % (key, os.environ[key]) for key in env_entries),
-            " ".join(map(pipes.quote, cmd)))).encode())
+        parts = [
+            " ".join("%s=%s" % (key, os.environ[key]) for key in env_entries),
+            " ".join("%s=%s" % (k, v) for k, v in extra_env.items()),
+            " ".join(map(pipes.quote, cmd))
+        ]
+        logfile.write(("+ %s\n" % " ".join(parts)).encode())
         logfile.flush()
 
         self.gdb_ports = []
-        self.process = self.start(cmd, logfile)
+        self.process = self.start(cmd, logfile, extra_env)
 
-    def start(self, cmd, logfile):
+    def start(self, cmd, logfile, extra_env):
+        combined_env = {**os.environ, **extra_env}
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                stdout=logfile, stderr=logfile)
+                stdout=logfile, stderr=logfile, env=combined_env)
 
         try:
             # Wait for OpenOCD to have made it through riscv_examine(). When
@@ -406,6 +457,9 @@ class NoSymbol(Exception):
         Exception.__init__(self)
         self.symbol = symbol
 
+    def __repr__(self):
+        return "NoSymbol(%r)" % self.symbol
+
 Thread = collections.namedtuple('Thread', ('id', 'description', 'target_id',
     'name', 'frame'))
 
@@ -508,15 +562,14 @@ class Gdb:
             11, 149, 107, 163, 73, 47, 43, 173, 7, 109, 101, 103, 191, 2, 139,
             97, 193, 157, 3, 29, 79, 113, 5, 89, 19, 37, 71, 179, 59, 137, 53)
 
-    def __init__(self, ports,
-            cmd="riscv64-unknown-elf-gdb",
-            timeout=60, binary=None):
+    def __init__(self, target, ports, cmd=None, timeout=60, binaries=None):
         assert ports
 
+        self.target = target
         self.ports = ports
-        self.cmd = cmd
+        self.cmd = cmd or "riscv64-unknown-elf-gdb"
         self.timeout = timeout
-        self.binary = binary
+        self.binaries = binaries or [None] * len(ports)
 
         self.reset_delay_index = 0
         self.stack = []
@@ -530,26 +583,30 @@ class Gdb:
             self.logfiles.append(logfile)
             if print_log_names:
                 real_stdout.write("Temporary gdb log: %s\n" % logfile.name)
-            child = pexpect.spawn(cmd)
+            child = pexpect.spawn(self.cmd)
             child.logfile = logfile
-            child.logfile.write(("+ %s\n" % cmd).encode())
+            child.logfile.write(("+ %s\n" % self.cmd).encode())
             self.children.append(child)
         self.active_child = self.children[0]
 
     def connect(self):
-        for port, child in zip(self.ports, self.children):
+        for port, child, binary in zip(self.ports, self.children,
+                                       self.binaries):
             self.select_child(child)
             self.wait()
-            self.command("set style enabled off")
-            self.command("set confirm off")
-            self.command("set width 0")
-            self.command("set height 0")
+            self.command("set style enabled off", reset_delays=None)
+            self.command("set confirm off", reset_delays=None)
+            self.command("set width 0", reset_delays=None)
+            self.command("set height 0", reset_delays=None)
             # Force consistency.
-            self.command("set print entry-values no")
-            self.command("set remotetimeout %d" % self.timeout)
-            self.command("target extended-remote localhost:%d" % port, ops=10)
-            if self.binary:
-                self.command("file %s" % self.binary)
+            self.command("set print entry-values no", reset_delays=None)
+            self.command("set remotetimeout %d" % self.timeout,
+                         reset_delays=None)
+            self.command("target extended-remote localhost:%d" % port, ops=10,
+                         reset_delays=None)
+            if binary:
+                output = self.command("file %s" % binary)
+                assertIn("Reading symbols", output)
             threads = self.threads()
             for t in threads:
                 hartid = None
@@ -611,11 +668,11 @@ class Gdb:
                         len(self.reset_delays)
             self.command("monitor riscv reset_delays %d" % reset_delays,
                     reset_delays=None)
-        timeout = ops * self.timeout
+        timeout = max(1, ops) * self.timeout
         self.active_child.sendline(command)
         self.active_child.expect("\n", timeout=timeout)
         self.active_child.expect(r"\(gdb\)", timeout=timeout)
-        return self.active_child.before.strip().decode("utf-8")
+        return self.active_child.before.strip().decode("utf-8", errors="ignore")
 
     def global_command(self, command):
         """Execute this command on every gdb that we control."""
@@ -623,6 +680,20 @@ class Gdb:
             for child in self.children:
                 self.select_child(child)
                 self.command(command)
+
+    def system_command(self, command, ops=20):
+        """Execute this command on every unique system that we control."""
+        done = set()
+        output = ""
+        with PrivateState(self):
+            for i, child in enumerate(self.children):
+                self.select_child(child)
+                if self.target.harts[i].system in done:
+                    self.command("set $pc=_start")
+                else:
+                    output += self.command(command, ops=ops)
+                    done.add(self.target.harts[i].system)
+        return output
 
     def c(self, wait=True, sync=True, checkOutput=True, ops=20):
         """
@@ -678,7 +749,8 @@ class Gdb:
             self.interrupt()
 
     def x(self, address, size='w', count=1):
-        output = self.command("x/%d%s %s" % (count, size, address))
+        output = self.command("x/%d%s %s" % (count, size, address),
+                              ops=count / 16)
         values = []
         for line in output.splitlines():
             for value in line.split(':')[1].strip().split():
@@ -710,8 +782,8 @@ class Gdb:
         value = shlex.split(output.split('=')[-1].strip())[1]
         return value
 
-    def info_registers(self, group):
-        output = self.command("info registers %s" % group, ops=5)
+    def info_registers(self, group="", ops=5):
+        output = self.command("info registers %s" % group, ops=ops)
         result = {}
         for line in output.splitlines():
             m = re.match(r"(\w+)\s+({.*})(?:\s+(\(.*\)))?", line)
@@ -731,10 +803,10 @@ class Gdb:
         return output
 
     def load(self):
-        output = self.command("load", ops=1000)
+        output = self.system_command("load", ops=1000)
         assert "failed" not in  output
         assert "Transfer rate" in output
-        output = self.command("compare-sections", ops=1000)
+        output = self.system_command("compare-sections", ops=1000)
         assert "matched" in output
         assert "MIS" not in output
 
@@ -778,8 +850,6 @@ class Gdb:
             if m:
                 threads.append(Thread(*m.groups()))
         assert threads
-        #>>>if not threads:
-        #>>>    threads.append(Thread('1', '1', 'Default', '???'))
         return threads
 
     def thread(self, thread):
@@ -931,9 +1001,10 @@ def print_log_handle(name, handle):
     print()
 
 def print_log(path):
-    print_log_handle(path, open(path, "r"))
+    print_log_handle(path, open(path, "r", errors='ignore'))
 
 class BaseTest:
+    # pylint: disable=too-many-instance-attributes
     compiled = {}
 
     def __init__(self, target, hart=None):
@@ -947,6 +1018,7 @@ class BaseTest:
         self.binary = None
         self.start = 0
         self.logs = []
+        self.binaries = []
 
     def early_applicable(self):
         """Return a false value if the test has determined it cannot run
@@ -954,24 +1026,33 @@ class BaseTest:
         # pylint: disable=no-self-use
         return True
 
+    def freertos(self):
+        """Return a true value if the test is running a FreeRTOS binary where
+        the debugger should expose FreeRTOS threads to gdb."""
+        # pylint: disable=no-self-use
+        return False
+
     def setup(self):
         pass
 
     def compile(self):
         compile_args = getattr(self, 'compile_args', None)
+        self.binaries = []
         if compile_args:
-            if compile_args not in BaseTest.compiled:
-                BaseTest.compiled[compile_args] = \
-                        self.target.compile(self.hart, *compile_args)
-        self.binary = BaseTest.compiled.get(compile_args)
+            for hart in self.target.harts:
+                key = (compile_args, hart.misa)
+                if key not in BaseTest.compiled:
+                    BaseTest.compiled[key] = \
+                            self.target.compile(hart, *compile_args)
+                self.binaries.append(BaseTest.compiled.get(key))
 
     def classSetup(self):
         self.compile()
         self.target_process = self.target.create()
         if self.target_process:
-            self.logs.append(self.target_process.logname)
+            self.logs += self.target_process.lognames
         try:
-            self.server = self.target.server()
+            self.server = self.target.server(self)
             self.logs.append(self.server.logname)
         except Exception:
             for log in self.logs:
@@ -987,7 +1068,7 @@ class BaseTest:
 
     def run(self):
         """
-        If compile_args is set, compile a program and set self.binary.
+        If compile_args is set, compile a program and set self.binaries.
 
         Call setup().
 
@@ -1032,7 +1113,7 @@ class BaseTest:
             # Get handles to logs before the files are deleted.
             logs = []
             for log in self.logs:
-                logs.append((log, open(log, "r")))
+                logs.append((log, open(log, "r", errors='ignore')))
 
             self.classTeardown()
             for name, handle in logs:
@@ -1058,12 +1139,8 @@ class GdbTest(BaseTest):
     def classSetup(self):
         BaseTest.classSetup(self)
 
-        if gdb_cmd:
-            self.gdb = Gdb(self.server.gdb_ports, gdb_cmd,
-                    timeout=self.target.timeout_sec, binary=self.binary)
-        else:
-            self.gdb = Gdb(self.server.gdb_ports,
-                    timeout=self.target.timeout_sec, binary=self.binary)
+        self.gdb = Gdb(self.target, self.server.gdb_ports, cmd=gdb_cmd,
+                       timeout=self.target.timeout_sec, binaries=self.binaries)
 
         self.logs += self.gdb.lognames()
         self.gdb.connect()
