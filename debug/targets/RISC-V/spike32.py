@@ -3,7 +3,7 @@ import testlib
 
 class spike32_hart(targets.Hart):
     xlen = 32
-    ram = 0x10000000
+    ram = 0x10100000
     ram_size = 0x10000000
     bad_address = ram - 8
     instruction_hardware_breakpoint_count = 4
@@ -17,6 +17,7 @@ class spike32(targets.Target):
     implements_custom_test = True
     support_memory_sampling = False # Needs SBA
     freertos_binary = "bin/RTOSDemo32.axf"
+    support_unavailable_control = True
 
     def create(self):
         # 64-bit FPRs on 32-bit target

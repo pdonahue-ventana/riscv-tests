@@ -17,8 +17,10 @@ class spike64(targets.Target):
     timeout_sec = 30
     implements_custom_test = True
     freertos_binary = "bin/RTOSDemo64.axf"
+    support_unavailable_control = True
 
     def create(self):
         # 32-bit FPRs only
         return testlib.Spike(self, isa="RV64IMAFC", progbufsize=0,
-                abstract_rti=30, support_abstract_csr=True)
+                abstract_rti=30, support_abstract_csr=True,
+                support_abstract_fpr=True)

@@ -33,6 +33,9 @@ class Hart:
     # no device mapped to that location.
     bad_address = None
 
+    # The non-existent register for access test
+    nonexist_csr = "csr2288"
+
     # Number of instruction triggers the hart supports.
     instruction_hardware_breakpoint_count = 0
 
@@ -49,6 +52,9 @@ class Hart:
     # hartids within that system.  So for most cases the default value of None
     # is fine.
     system = None
+
+    # Supports the cease instruction, which causes a hart to become unavailable.
+    support_cease = False
 
     def __init__(self, misa=None, system=None, link_script_path=None):
         if misa:
@@ -90,8 +96,11 @@ class Target:
     # before starting the test.
     gdb_setup = []
 
-    # Supports mtime at 0x2004000
+    # Supports mtime default at clint_addr + 0x4000
     supports_clint_mtime = True
+
+    # CLINT register address, set to the default value of spike.
+    clint_addr = 0x02000000
 
     # Implements custom debug registers like spike does. It seems unlikely any
     # hardware will every do that.
@@ -126,6 +135,12 @@ class Target:
     # in https://github.com/FreeRTOS/FreeRTOS.
     freertos_binary = None
 
+    # Supports controlling hart availability through DMCUSTOM.
+    support_unavailable_control = False
+
+    # Instruction count limit
+    icount_limit = 4
+
     # Internal variables:
     directory = None
     temporary_files = []
@@ -136,6 +151,7 @@ class Target:
         self.directory = os.path.dirname(path)
         self.server_cmd = parsed.server_cmd
         self.sim_cmd = parsed.sim_cmd
+        self.debug_server = parsed.debug_server
         self.temporary_binary = None
         self.compiler_supports_v = True
         Target.isolate = parsed.isolate
@@ -143,7 +159,7 @@ class Target:
             self.name = type(self).__name__
         # Default OpenOCD config file to <name>.cfg
         if not self.openocd_config_path:
-            self.openocd_config_path = "%s.cfg" % self.name
+            self.openocd_config_path = f"{self.name}.cfg"
         self.openocd_config_path = os.path.join(self.directory,
                 self.openocd_config_path)
         for i, hart in enumerate(self.harts):
@@ -151,10 +167,10 @@ class Target:
             if not hasattr(hart, 'id'):
                 hart.id = i
             if not hart.name:
-                hart.name = "%s-%d" % (self.name, i)
+                hart.name = f"{self.name}-{i}"
             # Default link script to <name>.lds
             if not hart.link_script_path:
-                hart.link_script_path = "%s.lds" % self.name
+                hart.link_script_path = f"{self.name}.lds"
             hart.link_script_path = os.path.join(self.directory,
                     hart.link_script_path)
 
@@ -166,45 +182,48 @@ class Target:
         return testlib.Openocd(server_cmd=self.server_cmd,
                 config=self.openocd_config_path,
                 timeout=self.server_timeout_sec,
-                freertos=test.freertos())
+                freertos=test.freertos(),
+                debug_openocd=self.debug_server)
 
     def do_compile(self, hart, *sources):
-        binary_name = "%s_%s-%x" % (
-                self.name,
-                os.path.basename(os.path.splitext(sources[0])[0]),
-                hart.misa)
+        binary_name = (
+                self.name + "_" +
+                os.path.basename(os.path.splitext(sources[0])[0]) + "-" +
+                f"{hart.misa:x}")
         if Target.isolate:
+            # pylint: disable-next=consider-using-with
             self.temporary_binary = tempfile.NamedTemporaryFile(
                     prefix=binary_name + "_")
             binary_name = self.temporary_binary.name
             Target.temporary_files.append(self.temporary_binary)
 
         args = list(sources) + [
+                f"-DCLINT={self.clint_addr}",
                 "programs/entry.S", "programs/init.c",
-                "-DNHARTS=%d" % len(self.harts),
+                f"-DNHARTS={len(self.harts)}",
                 "-I", "../env",
                 "-T", hart.link_script_path,
                 "-nostartfiles",
                 "-mcmodel=medany",
-                "-DXLEN=%d" % hart.xlen,
+                f"-DXLEN={hart.xlen}",
                 "-o", binary_name]
 
         if hart.extensionSupported('e'):
-            args.append("-march=rv32e")
+            args.append("-march=rv32e_zicsr")
             args.append("-mabi=ilp32e")
             args.append("-DRV32E")
         else:
-            march = "rv%dima" % hart.xlen
+            march = f"rv{hart.xlen}ima"
             for letter in "fdc":
                 if hart.extensionSupported(letter):
                     march += letter
             if hart.extensionSupported("v") and self.compiler_supports_v:
                 march += "v"
-            args.append("-march=%s" % march)
+            args.append(f"-march={march}_zicsr")
             if hart.xlen == 32:
                 args.append("-mabi=ilp32")
             else:
-                args.append("-mabi=lp%d" % hart.xlen)
+                args.append(f"-mabi=lp{hart.xlen}")
 
         testlib.compile(args)
         return binary_name
@@ -221,11 +240,12 @@ class Target:
                         r"ISA extension `(\w)'", e.stderr.decode())
                 if m and m.group(1) in "v":
                     extension = m.group(1)
-                    print("Disabling extension %r because the "
-                            "compiler doesn't support it." % extension)
+                    print(f"Disabling extension {extension!r} because the "
+                            "compiler doesn't support it.")
                     self.compiler_supports_v = False
                 else:
                     raise
+        return None
 
 def add_target_options(parser):
     parser.add_argument("target", help=".py file that contains definition for "
@@ -235,6 +255,8 @@ def add_target_options(parser):
             "simulation)", default="spike")
     parser.add_argument("--server_cmd",
             help="The command to use to start the debug server (e.g. OpenOCD)")
+    parser.add_argument("--debug_server", action="store_true",
+            help="Open gdb in a separate terminal on the debug server")
 
     xlen_group = parser.add_mutually_exclusive_group()
     xlen_group.add_argument("--32", action="store_const", const=32,
@@ -246,6 +268,9 @@ def add_target_options(parser):
             help="Try to run in such a way that multiple instances can run at "
             "the same time. This may make it harder to debug a failure if it "
             "does occur.")
+
+class TargetsException(Exception):
+    pass
 
 def target(parsed):
     directory = os.path.dirname(parsed.target)
@@ -259,18 +284,18 @@ def target(parsed):
         definition = getattr(module, name)
         if isinstance(definition, type) and issubclass(definition, Target):
             found.append(definition)
-    assert len(found) == 1, "%s does not define exactly one subclass of " \
-            "targets.Target" % parsed.target
+    assert len(found) == 1, (f"{parsed.target} does not define exactly one "
+                             "subclass of targets.Target")
 
     t = found[0](parsed.target, parsed)
-    assert t.harts, "%s doesn't have any harts defined!" % t.name
+    assert t.harts, f"{t.name} doesn't have any harts defined!"
     if parsed.xlen > 0:
         for h in t.harts:
             if h.xlen == 0:
                 h.xlen = parsed.xlen
             elif h.xlen != parsed.xlen:
-                raise Exception("The target hart specified an XLEN of %d, but "\
-                        "the command line specified an XLEN of %d. They must "\
-                        "match." % (h.xlen, parsed.xlen))
+                raise TargetsException("The target hart specified an XLEN of "
+                        f"{h.xlen}, but the command line specified an XLEN of "
+                        f"{parsed.xlen}. They must match.")
 
     return t
