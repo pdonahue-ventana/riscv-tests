@@ -11,6 +11,7 @@ import os
 import re
 import itertools
 
+from datetime import datetime
 import targets
 import testlib
 from testlib import assertEqual, assertNotEqual
@@ -1415,7 +1416,7 @@ class TriggerDmode(TriggerTest):
         i = 0
         for i in range(16):
             tdata1 = self.gdb.p(f"(({xlen_type} *)&data)[{2*i}]")
-            if tdata1 == 0:
+            if (tdata1 == 0) or (tdata1 >> (self.hart.xlen-4) == 15):
                 break
             tdata2 = self.gdb.p(f"(({xlen_type} *)&data)[{2*i+1}]")
 
@@ -1678,6 +1679,10 @@ class TranslateTest(GdbSingleHartTest):
         assertEqual(0x55667788, self.gdb.p("physical[1]"))
         assertEqual(0xdeadbeef, self.gdb.p("virtual[0]"))
         assertEqual(0x55667788, self.gdb.p("virtual[1]"))
+
+        # disable mmu
+        self.gdb.p("$mstatus=$mstatus & ~0x20000")
+        self.gdb.p("$satp=0")
 
 SATP_MODE_OFF = 0
 SATP_MODE_SV32 = 1
@@ -2139,6 +2144,7 @@ class IcountTest(DebugTest):
         main_post_csrr = self.gdb.p("&main_post_csrr")
         assertEqual(self.gdb.p("$pc"), main_post_csrr)
 
+        self.gdb.command("delete")
         self.gdb.command("monitor riscv icount clear")
 
         # Execute 1 instruction.
@@ -2193,6 +2199,14 @@ def main():
     testlib.print_log_names = parsed.print_log_names
 
     module = sys.modules[__name__]
+
+    # initialize PRNG
+    selected_seed = parsed.seed
+    if parsed.seed is None:
+        selected_seed = int(datetime.now().timestamp())
+        print(f"PRNG seed for {target.name} is generated automatically")
+    print(f"PRNG seed for {target.name} is {selected_seed}")
+    random.seed(selected_seed)
 
     return testlib.run_all_tests(module, target, parsed)
 
