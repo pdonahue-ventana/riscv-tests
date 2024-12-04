@@ -1,6 +1,7 @@
 import collections
 import os
 import os.path
+import random
 import re
 import shlex
 import subprocess
@@ -8,6 +9,8 @@ import sys
 import tempfile
 import time
 import traceback
+
+from datetime import datetime
 
 import tty
 import pexpect
@@ -62,6 +65,7 @@ def compile(args): # pylint: disable=redefined-builtin
 class Spike:
     # pylint: disable=too-many-instance-attributes
     # pylint: disable=too-many-locals
+    # pylint: disable=too-many-positional-arguments
     def __init__(self, target, halted=False, timeout=None, with_jtag_gdb=True,
             isa=None, progbufsize=None, dmi_rti=None, abstract_rti=None,
             support_hasel=True, support_abstract_csr=True,
@@ -134,6 +138,9 @@ class Spike:
         else:
             isa = f"RV{self.harts[0].xlen}G"
 
+        if 'V' in isa[2:]:
+            isa += f"_Zvl{self.vlen}b_Zve{self.elen}d"
+
         cmd += ["--isa", isa]
         cmd += ["--dm-auth"]
 
@@ -159,8 +166,6 @@ class Spike:
         if not self.support_haltgroups:
             cmd.append("--dm-no-halt-groups")
 
-        if 'V' in isa[2:]:
-            cmd.append(f"--varch=vlen:{self.vlen},elen:{self.elen}")
 
         assert len(set(t.ram for t in self.harts)) == 1, \
                 "All spike harts must have the same RAM layout"
@@ -296,6 +301,8 @@ class VcsSim:
 class Openocd:
     # pylint: disable=too-many-instance-attributes
     # pylint: disable-next=consider-using-with
+    # pylint: disable=too-many-positional-arguments
+    # pylint: disable=consider-using-with
     logfile = tempfile.NamedTemporaryFile(prefix='openocd', suffix='.log')
     logname = logfile.name
 
@@ -367,10 +374,15 @@ class Openocd:
         self.tclrpc_port = None
         self.start(cmd, logfile, extra_env)
 
-        self.openocd_cli = pexpect.spawn(f"nc localhost {self.tclrpc_port}")
+        self.openocd_cli = pexpect.spawn(f"nc localhost {self.tclrpc_port}",
+            echo=False)
         # TCL-RPC uses \x1a as a watermark for end of message. We set raw
         # pty mode to disable translation of \x1a to EOF
         tty.setraw(self.openocd_cli.child_fd)
+        hello_string = self.command(
+            "capture { echo \"Hello TCL-RPC!\" }").decode()
+        if not "Hello TCL-RPC!" in hello_string:
+            raise RuntimeError(f"TCL-RPC - unexpected reply:\n{hello_string}")
 
     def start(self, cmd, logfile, extra_env):
         combined_env = {**os.environ, **extra_env}
@@ -708,6 +720,7 @@ class Gdb:
             11, 149, 107, 163, 73, 47, 43, 173, 7, 109, 101, 103, 191, 2, 139,
             97, 193, 157, 3, 29, 79, 113, 5, 89, 19, 37, 71, 179, 59, 137, 53)
 
+    # pylint: disable=too-many-positional-arguments
     def __init__(self, target, ports, cmd=None, timeout=60, binaries=None,
                  logremote=False):
         assert ports
@@ -1155,6 +1168,14 @@ def run_all_tests(module, target, parsed):
     excluded_tests = load_excluded_tests(parsed.exclude_tests, target.name)
     target.skip_tests += excluded_tests
 
+    # initialize PRNG
+    selected_seed = parsed.seed
+    if parsed.seed is None:
+        selected_seed = int(datetime.now().timestamp())
+        print(f"PRNG seed for {target.name} is generated automatically")
+    print(f"PRNG seed for {target.name} is {selected_seed}")
+    random.seed(selected_seed)
+
     results, count = run_tests(parsed, target, todo)
 
     header(f"ran {count} tests in {time.time() - overall_start:.0f}s", dash=':')
@@ -1287,7 +1308,6 @@ class BaseTest:
         if not hart is None:
             self.hart = hart
         else:
-            import random   # pylint: disable=import-outside-toplevel
             self.hart = random.choice(target.harts)
             #self.hart = target.harts[-1]
         self.server = None
@@ -1465,6 +1485,22 @@ class GdbTest(BaseTest):
         self.gdb.select_hart(self.hart)
         self.gdb.command(f"monitor targets {self.hart.id}")
 
+    def set_pmp_deny(self, address, size=4 * 1024):
+        # Enable physical memory protection, no permission to access specific
+        # address range (default 4KB).
+        self.gdb.p("$mseccfg=0x4")  # RLB
+        self.gdb.p("$pmpcfg0=0x98") # L, NAPOT, !R, !W, !X
+        self.gdb.p("$pmpaddr0="
+                       f"0x{((address >> 2) | ((size - 1) >> 3)):x}")
+        # PMP changes require an sfence.vma, 0x12000073 is sfence.vma
+        self.gdb.command("monitor riscv exec_progbuf 0x12000073")
+
+    def reset_pmp_deny(self):
+        self.gdb.p("$pmpcfg0=0")
+        self.gdb.p("$pmpaddr0=0")
+        # PMP changes require an sfence.vma, 0x12000073 is sfence.vma
+        self.gdb.command("monitor riscv exec_progbuf 0x12000073")
+
     def disable_pmp(self):
         # Disable physical memory protection by allowing U mode access to all
         # memory.
@@ -1478,6 +1514,9 @@ class GdbTest(BaseTest):
                 # pmcfg0 readback matches write, so TOR is supported.
                 self.gdb.p("$pmpaddr0="
                            f"0x{(self.hart.ram + self.hart.ram_size) >> 2:x}")
+            if self.target.implements_page_virtual_memory:
+                # PMP changes require an sfence.vma, 0x12000073 is sfence.vma
+                self.gdb.command("monitor riscv exec_progbuf 0x12000073")
         except CouldNotFetch:
             # PMP registers are optional
             pass
@@ -1488,6 +1527,9 @@ class GdbTest(BaseTest):
             if interrupt:
                 self.gdb.interrupt()
             self.gdb.p("$mie=$mie & ~0x80")
+            self.gdb.p("$mstatus=$mstatus & ~0x8")
+            self.gdb.p(f"*((long long*) 0x{self.target.clint_addr + 0x4000:x})\
+                    =0x" + "f" * (self.hart.xlen // 4))
 
     def exit(self, expected_result=10):
         self.gdb.command("delete")
